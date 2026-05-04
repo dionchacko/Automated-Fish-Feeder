@@ -1,0 +1,733 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+
+/* WIFI */
+const char* ssid = "Device Name";
+const char* password = "*******";
+
+/* OBJECTS */
+WebServer server(80);
+RTC_DS3231 rtc;
+LiquidCrystal_I2C lcd(0x27,16,2);
+Servo feederServo;
+
+/* SERVO */
+const int servoPin = 4;
+const int OPEN_POS = 90;
+const int CLOSE_POS = 0;
+
+/* AUTO FEED TIMER */
+unsigned long lastFeed = 0;
+const unsigned long feedInterval = 30000;
+
+/* SCHEDULE */
+int sch_day=0;
+int sch_month=0;
+int sch_hour=0;
+int sch_minute=0;
+bool scheduleActive=false;
+
+/* EVENT LOGS */
+String pastEvents="";
+String nextEvent="No Schedule";
+
+/* ---------- FULL HTML DASHBOARD ---------- */
+
+const char webpage[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Smart Fish Feeder Dashboard</title>
+
+<style>
+
+body{
+background:#0f172a;
+color:white;
+font-family:Segoe UI;
+margin:0;
+}
+
+header{
+background:#020617;
+padding:20px;
+font-size:22px;
+}
+
+.container{
+padding:25px;
+display:grid;
+grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+gap:20px;
+}
+
+.card{
+background:#1e293b;
+padding:20px;
+border-radius:10px;
+}
+
+button{
+background:#3b82f6;
+border:none;
+padding:10px 18px;
+border-radius:6px;
+color:white;
+font-size:15px;
+cursor:pointer;
+}
+
+button:hover{
+background:#2563eb;
+}
+
+input{
+width:100%;
+padding:8px;
+margin-top:6px;
+margin-bottom:10px;
+border:none;
+border-radius:6px;
+background:#020617;
+color:white;
+}
+
+.log{
+background:#020617;
+padding:10px;
+height:150px;
+overflow-y:auto;
+border-radius:6px;
+}
+
+</style>
+</head>
+
+<body>
+
+<header>
+🐟 Smart Fish Feeder Dashboard
+</header>
+
+<div class="container">
+
+<div class="card">
+<h2>Manual Feeding</h2>
+<p>Press button to feed instantly</p>
+<br>
+<button onclick="manualFeed()">Feed Now</button>
+</div>
+
+<div class="card">
+
+<h2>Schedule Feeding</h2>
+
+<label>Day</label>
+<input type="number" id="day">
+
+<label>Month</label>
+<input type="number" id="month">
+
+<label>Hour</label>
+<input type="number" id="hour">
+
+<label>Minute</label>
+<input type="number" id="minute">
+
+<button onclick="setFeedTime()">Save Schedule</button>
+
+</div>
+
+<div class="card">
+<h2>Next Feeding</h2>
+<p id="nextFeed">No Schedule</p>
+</div>
+
+<div class="card">
+<h2>Past Feeding Events</h2>
+<div class="log" id="history"></div>
+</div>
+
+</div>
+
+<script>
+
+function manualFeed(){
+
+fetch("/feed")
+.then(res=>res.text())
+.then(data=>{
+
+let now=new Date();
+let log=now.toLocaleString()+" - Feeding Done";
+
+document.getElementById("history").innerHTML += log+"<br>";
+
+});
+
+}
+
+function setFeedTime(){
+
+let day=document.getElementById("day").value;
+let month=document.getElementById("month").value;
+let hour=document.getElementById("hour").value;
+let minute=document.getElementById("minute").value;
+
+fetch(`/set?day=${day}&month=${month}&hour=${hour}&minute=${minute}`);
+
+document.getElementById("nextFeed").innerHTML =
+day+"/"+month+" "+hour+":"+minute;
+
+}
+
+</script>
+
+</body>
+</html>
+
+)rawliteral";
+
+/* ---------- FEED FUNCTION ---------- */
+
+void feedFish()
+{
+  DateTime now = rtc.now();
+
+  String event =
+  String(now.day()) + "/" +
+  String(now.month()) + " " +
+  String(now.hour()) + ":" +
+  String(now.minute()) + ":" +
+  String(now.second()) +
+  " - Feeding Done";
+
+  pastEvents += event + "<br>";
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("FEEDING...");
+
+  feederServo.write(OPEN_POS);
+  delay(350);
+
+  feederServo.write(CLOSE_POS);
+
+  delay(1500);
+  lcd.clear();
+}
+
+/* ---------- WEB ROUTES ---------- */
+
+void handleRoot()
+{
+  server.send_P(200,"text/html",webpage);
+}
+
+void handleFeed()
+{
+  feedFish();
+  server.send(200,"text/plain","Feeding Done");
+}
+
+void handleSchedule()
+{
+  sch_day = server.arg("day").toInt();
+  sch_month = server.arg("month").toInt();
+  sch_hour = server.arg("hour").toInt();
+  sch_minute = server.arg("minute").toInt();
+
+  scheduleActive=true;
+
+  nextEvent =
+  String(sch_day)+"/"+
+  String(sch_month)+" "+
+  String(sch_hour)+":"+
+  String(sch_minute);
+
+  server.send(200,"text/plain","Schedule Saved");
+}
+
+/* ---------- SETUP ---------- */
+
+void setup()
+{
+
+Serial.begin(115200);
+
+Wire.begin();
+rtc.begin();
+
+lcd.init();
+lcd.backlight();
+
+feederServo.attach(servoPin);
+feederServo.write(CLOSE_POS);
+
+/* WIFI */
+
+Serial.println("Connecting to WiFi");
+
+WiFi.begin(ssid,password);
+
+while(WiFi.status()!=WL_CONNECTED)
+{
+delay(500);
+Serial.print(".");
+}
+
+Serial.println("");
+Serial.println("WiFi Connected");
+
+Serial.print("IP Address: ");
+Serial.println(WiFi.localIP());
+
+lcd.setCursor(0,0);
+lcd.print("WiFi Connected");
+
+delay(2000);
+lcd.clear();
+
+/* WEB SERVER */
+
+server.on("/",handleRoot);
+server.on("/feed",handleFeed);
+server.on("/set",handleSchedule);
+
+server.begin();
+
+Serial.println("Server Started");
+
+}
+
+/* ---------- LOOP ---------- */
+
+void loop()
+{
+
+server.handleClient();
+
+DateTime now = rtc.now();
+
+/* LCD CLOCK */
+
+lcd.setCursor(0,0);
+
+if(now.hour()<10) lcd.print("0");
+lcd.print(now.hour());
+lcd.print(":");
+
+if(now.minute()<10) lcd.print("0");
+lcd.print(now.minute());
+lcd.print(":");
+
+if(now.second()<10) lcd.print("0");
+lcd.print(now.second());
+
+lcd.setCursor(0,1);
+
+if(now.day()<10) lcd.print("0");
+lcd.print(now.day());
+lcd.print("/");
+
+if(now.month()<10) lcd.print("0");
+lcd.print(now.month());
+lcd.print("/");
+
+lcd.print(now.year());
+
+/* AUTO FEED */
+
+if(millis()-lastFeed >= feedInterval)
+{
+feedFish();
+lastFeed=millis();
+}
+
+/* SCHEDULE FEED */
+
+if(scheduleActive)
+{
+if(now.day()==sch_day &&
+   now.month()==sch_month &&
+   now.hour()==sch_hour &&
+   now.minute()==sch_minute &&
+   now.second()==0)
+{
+feedFish();
+}
+}
+
+}#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+
+/* WIFI */
+const char* ssid = "realme GT 2";
+const char* password = "12345678";
+
+/* OBJECTS */
+WebServer server(80);
+RTC_DS3231 rtc;
+LiquidCrystal_I2C lcd(0x27,16,2);
+Servo feederServo;
+
+/* SERVO */
+const int servoPin = 4;
+const int OPEN_POS = 90;
+const int CLOSE_POS = 0;
+
+/* AUTO FEED TIMER */
+unsigned long lastFeed = 0;
+const unsigned long feedInterval = 30000;
+
+/* SCHEDULE */
+int sch_day=0;
+int sch_month=0;
+int sch_hour=0;
+int sch_minute=0;
+bool scheduleActive=false;
+
+/* EVENT LOGS */
+String pastEvents="";
+String nextEvent="No Schedule";
+
+/* ---------- FULL HTML DASHBOARD ---------- */
+
+const char webpage[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Smart Fish Feeder Dashboard</title>
+
+<style>
+
+body{
+background:#0f172a;
+color:white;
+font-family:Segoe UI;
+margin:0;
+}
+
+header{
+background:#020617;
+padding:20px;
+font-size:22px;
+}
+
+.container{
+padding:25px;
+display:grid;
+grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+gap:20px;
+}
+
+.card{
+background:#1e293b;
+padding:20px;
+border-radius:10px;
+}
+
+button{
+background:#3b82f6;
+border:none;
+padding:10px 18px;
+border-radius:6px;
+color:white;
+font-size:15px;
+cursor:pointer;
+}
+
+button:hover{
+background:#2563eb;
+}
+
+input{
+width:100%;
+padding:8px;
+margin-top:6px;
+margin-bottom:10px;
+border:none;
+border-radius:6px;
+background:#020617;
+color:white;
+}
+
+.log{
+background:#020617;
+padding:10px;
+height:150px;
+overflow-y:auto;
+border-radius:6px;
+}
+
+</style>
+</head>
+
+<body>
+
+<header>
+🐟 Smart Fish Feeder Dashboard
+</header>
+
+<div class="container">
+
+<div class="card">
+<h2>Manual Feeding</h2>
+<p>Press button to feed instantly</p>
+<br>
+<button onclick="manualFeed()">Feed Now</button>
+</div>
+
+<div class="card">
+
+<h2>Schedule Feeding</h2>
+
+<label>Day</label>
+<input type="number" id="day">
+
+<label>Month</label>
+<input type="number" id="month">
+
+<label>Hour</label>
+<input type="number" id="hour">
+
+<label>Minute</label>
+<input type="number" id="minute">
+
+<button onclick="setFeedTime()">Save Schedule</button>
+
+</div>
+
+<div class="card">
+<h2>Next Feeding</h2>
+<p id="nextFeed">No Schedule</p>
+</div>
+
+<div class="card">
+<h2>Past Feeding Events</h2>
+<div class="log" id="history"></div>
+</div>
+
+</div>
+
+<script>
+
+function manualFeed(){
+
+fetch("/feed")
+.then(res=>res.text())
+.then(data=>{
+
+let now=new Date();
+let log=now.toLocaleString()+" - Feeding Done";
+
+document.getElementById("history").innerHTML += log+"<br>";
+
+});
+
+}
+
+function setFeedTime(){
+
+let day=document.getElementById("day").value;
+let month=document.getElementById("month").value;
+let hour=document.getElementById("hour").value;
+let minute=document.getElementById("minute").value;
+
+fetch(`/set?day=${day}&month=${month}&hour=${hour}&minute=${minute}`);
+
+document.getElementById("nextFeed").innerHTML =
+day+"/"+month+" "+hour+":"+minute;
+
+}
+
+</script>
+
+</body>
+</html>
+
+)rawliteral";
+
+/* ---------- FEED FUNCTION ---------- */
+
+void feedFish()
+{
+  DateTime now = rtc.now();
+
+  String event =
+  String(now.day()) + "/" +
+  String(now.month()) + " " +
+  String(now.hour()) + ":" +
+  String(now.minute()) + ":" +
+  String(now.second()) +
+  " - Feeding Done";
+
+  pastEvents += event + "<br>";
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("FEEDING...");
+
+  feederServo.write(OPEN_POS);
+  delay(350);
+
+  feederServo.write(CLOSE_POS);
+
+  delay(1500);
+  lcd.clear();
+}
+
+/* ---------- WEB ROUTES ---------- */
+
+void handleRoot()
+{
+  server.send_P(200,"text/html",webpage);
+}
+
+void handleFeed()
+{
+  feedFish();
+  server.send(200,"text/plain","Feeding Done");
+}
+
+void handleSchedule()
+{
+  sch_day = server.arg("day").toInt();
+  sch_month = server.arg("month").toInt();
+  sch_hour = server.arg("hour").toInt();
+  sch_minute = server.arg("minute").toInt();
+
+  scheduleActive=true;
+
+  nextEvent =
+  String(sch_day)+"/"+
+  String(sch_month)+" "+
+  String(sch_hour)+":"+
+  String(sch_minute);
+
+  server.send(200,"text/plain","Schedule Saved");
+}
+
+/* ---------- SETUP ---------- */
+
+void setup()
+{
+
+Serial.begin(115200);
+
+Wire.begin();
+rtc.begin();
+
+lcd.init();
+lcd.backlight();
+
+feederServo.attach(servoPin);
+feederServo.write(CLOSE_POS);
+
+/* WIFI */
+
+Serial.println("Connecting to WiFi");
+
+WiFi.begin(ssid,password);
+
+while(WiFi.status()!=WL_CONNECTED)
+{
+delay(500);
+Serial.print(".");
+}
+
+Serial.println("");
+Serial.println("WiFi Connected");
+
+Serial.print("IP Address: ");
+Serial.println(WiFi.localIP());
+
+lcd.setCursor(0,0);
+lcd.print("WiFi Connected");
+
+delay(2000);
+lcd.clear();
+
+/* WEB SERVER */
+
+server.on("/",handleRoot);
+server.on("/feed",handleFeed);
+server.on("/set",handleSchedule);
+
+server.begin();
+
+Serial.println("Server Started");
+
+}
+
+/* ---------- LOOP ---------- */
+
+void loop()
+{
+
+server.handleClient();
+
+DateTime now = rtc.now();
+
+/* LCD CLOCK */
+
+lcd.setCursor(0,0);
+
+if(now.hour()<10) lcd.print("0");
+lcd.print(now.hour());
+lcd.print(":");
+
+if(now.minute()<10) lcd.print("0");
+lcd.print(now.minute());
+lcd.print(":");
+
+if(now.second()<10) lcd.print("0");
+lcd.print(now.second());
+
+lcd.setCursor(0,1);
+
+if(now.day()<10) lcd.print("0");
+lcd.print(now.day());
+lcd.print("/");
+
+if(now.month()<10) lcd.print("0");
+lcd.print(now.month());
+lcd.print("/");
+
+lcd.print(now.year());
+
+/* AUTO FEED */
+
+if(millis()-lastFeed >= feedInterval)
+{
+feedFish();
+lastFeed=millis();
+}
+
+/* SCHEDULE FEED */
+
+if(scheduleActive)
+{
+if(now.day()==sch_day &&
+   now.month()==sch_month &&
+   now.hour()==sch_hour &&
+   now.minute()==sch_minute &&
+   now.second()==0)
+{
+feedFish();
+}
+}
+
+}
